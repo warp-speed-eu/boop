@@ -1,0 +1,78 @@
+# Boop on Upsun.
+#
+# One Go container. The Svelte UI is built with Node during the build hook and
+# embedded into the binary (vite writes to server/internal/web/dist, which
+# internal/web/web.go picks up with go:embed), so there is no static-file
+# location: the Go process serves everything.
+#
+# Mirrors `make build`:
+#   cd server/web && npm ci && npm run build
+#   cd server && go build -o bin/boop ./cmd/boop
+
+applications:
+  boop:
+    # go.mod requires go >= 1.27.0.
+    type: "golang:1.27"
+
+    source:
+      root: "server"
+
+    # The Go container has no Node. `n` is installed as a build dependency and
+    # pulls the version pinned in .tool-versions.
+    dependencies:
+      nodejs:
+        n: "*"
+
+    variables:
+      env:
+        N_PREFIX: /app/.global
+        # SQLite lives on the persistent mount below, not in the read-only app image.
+        BOOP_DATABASE_PATH: /app/data/boop.db
+        BOOP_LOG_LEVEL: info
+        # BOOP_BASE_URL is left unset on purpose: the server falls back to
+        # X-Forwarded-Proto/Host from the Upsun router, so every preview
+        # environment advertises its own URL. Set it only to override.
+
+    mounts:
+      "/data":
+        source: storage
+        source_path: data
+
+    hooks:
+      build: |
+        set -eu
+
+        # Node for the Vite build. Keep in sync with .tool-versions.
+        n 24.15.0
+        hash -r
+
+        # Reuse Go and npm caches across builds.
+        export GOCACHE="$PLATFORM_CACHE_DIR/go-build"
+        export GOMODCACHE="$PLATFORM_CACHE_DIR/go-mod"
+        export npm_config_cache="$PLATFORM_CACHE_DIR/npm"
+
+        # UI first: vite writes into internal/web/dist, which go:embed reads.
+        npm --prefix web ci
+        npm --prefix web run build
+
+        CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o bin/boop ./cmd/boop
+
+    web:
+      upstream:
+        socket_family: tcp
+        protocol: http
+      commands:
+        # Upsun assigns the port; Boop reads BOOP_PORT and listens on all interfaces.
+        start: "BOOP_PORT=$PORT bin/boop"
+      locations:
+        "/":
+          allow: false
+          passthru: true
+
+routes:
+  "https://{default}/":
+    type: upstream
+    upstream: "boop:http"
+  "http://{default}/":
+    type: redirect
+    to: "https://{default}/"
